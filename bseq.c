@@ -59,6 +59,7 @@ bseq1_t *bseq_read(bseq_file_t *fp, int chunk_size, int *n_, size_t *sizeToRead)
 		s->name = strdup(ks->name.s);
 		s->seq = strdup(ks->seq.s);
 		s->l_seq = ks->seq.l;
+		s->l_name = ks->name.l;
 		if (sizeToRead != NULL)
 		{
 	                s->qual = strdup(ks->qual.s);//vasu
@@ -94,6 +95,7 @@ bseq1_t *bseq_read2(bseq_file_t *fp, int n_)
 		s->seq = strdup(ks->seq.s);
                 s->qual = strdup(ks->qual.s);//vasu
 		s->l_seq = ks->seq.l;
+		s->l_name = ks->name.l;
 		size += ks->name.l + ks->comment.l + ks->plus_len + 2*seqs[n].l_seq + 4 + 2 + (ks->comment.l > 0);
 		n++;
 //		printf ("%d - *%s* *%s* - %d, %d, %d, %d\n", size, ks->name.s, ks->comment.s, ks->name.l, ks->comment.l, ks->plus_len, ks->seq.l);

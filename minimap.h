@@ -46,7 +46,7 @@ typedef struct {
 	char **name; // TODO: if this uses too much RAM, switch one concatenated string
 } mm_idx_t;
 
-typedef struct 
+typedef struct fullRec
 {
         int32_t pos;
         uint8_t seq[60];
@@ -56,14 +56,20 @@ typedef struct
         uint8_t  matchLen;
 }fullRec;
 
-typedef struct {
+typedef struct 
+{
+	size_t n, m; 
+	fullRec *a;
+}vec_fullRec;
+
+typedef struct mm_reg1_t{
 	int16_t score;
 	uint32_t cnt:31, rev:1;
 	uint32_t rid:31, rep:1;
 	uint32_t len;
 	int32_t qs, qe, rs, re;
 	int mapQ;
-	fullRec *fR;
+//	fullRec *fR;
 } mm_reg1_t;
 
 typedef struct {
@@ -108,7 +114,7 @@ mm_tbuf_t *mm_tbuf_init(void);
 void mm_tbuf_destroy(mm_tbuf_t *b);
 const mm_reg1_t *mm_map(const mm_idx_t *mi, int l_seq, const char *seq, int *n_regs, mm_tbuf_t *b, const mm_mapopt_t *opt, const char *name);
 
-int mm_map_file(int numOutChunks, int maxChunkSize, int numMaxChunks, int *numAlnRecs, fileIndex *fI, FILE **aebFp, char *oprefix, char **refFasta, const mm_idx_t *idx, const char *fn1, const char *fn2, const mm_mapopt_t *opt, int n_threads, int tbatch_size);
+int mm_map_file(int numTasks, int rank, int numInChunks, int numOutChunks, int maxChunkSize, int numMaxChunks, fileIndex *fI, FILE **aebFp, char *oprefix, char **refFasta, const mm_idx_t *idx, const char *fn1, const char *fn2, const mm_mapopt_t *opt, int n_threads, int tbatch_size);
 
 // private functions (may be moved to a "mmpriv.h" in future)
 double cputime(void);

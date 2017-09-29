@@ -1,6 +1,7 @@
 #include <pthread.h>
 #include <stdlib.h>
 #include <limits.h>
+#include <sys/time.h>
 
 /************
  * kt_for() *
@@ -84,15 +85,18 @@ typedef struct ktp_t {
 
 static void *ktp_worker(void *data)
 {
+
 	ktp_worker_t *w = (ktp_worker_t*)data;
 	ktp_t *p = w->pl;
 	while (w->step < p->n_steps) {
+//		printf ("ktp_worker while\n");
 		// test whether we can kick off the job with this worker
 		pthread_mutex_lock(&p->mutex);
 		for (;;) {
 			int i;
 			// test whether another worker is doing the same step
 			for (i = 0; i < p->n_workers; ++i) {
+//				printf ("\tktp_worker for\n");
 				if (w == &p->workers[i]) continue; // ignore itself
 				if (p->workers[i].step <= w->step && p->workers[i].index < w->index)
 					break;
@@ -103,8 +107,18 @@ static void *ktp_worker(void *data)
 		pthread_mutex_unlock(&p->mutex);
 
 		// working on w->step
+//		struct timeval sTime;
+//		gettimeofday (&sTime, NULL);
+//		double ktpstart = sTime.tv_sec + sTime.tv_usec * 1e-6;
+//		printf ("start ktp_worker at %lf sec\n", ktpstart);
+
 		w->data = p->func(p->shared, w->step, w->step? w->data : 0); // for the first step, input is NULL
 
+//		struct timeval eTime;
+//		gettimeofday (&eTime, NULL);
+//		double ktpend = eTime.tv_sec + eTime.tv_usec * 1e-6;
+//		printf ("end ktp_worker at %lf sec\n", ktpend);
+//		printf ("ktp_worker time %lf sec\n\n", ktpend-ktpstart);
 		// update step and let other workers know
 		pthread_mutex_lock(&p->mutex);
 		w->step = w->step == p->n_steps - 1 || w->data? (w->step + 1) % p->n_steps : p->n_steps;

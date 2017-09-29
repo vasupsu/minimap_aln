@@ -3,8 +3,8 @@
 #include <stdio.h>
 #include <assert.h>
 #include "bseq.h"
-#include "kvec.h"
 #include "minimap.h"
+#include "kvec.h"
 #include "sdust.h"
 
 FILE *fpUnMapped;
@@ -336,13 +336,15 @@ typedef struct {
 	int numOutChunks;
 	int maxChunkSize;
 	int numMaxChunks;
-	int *numAlnRecs;
 	FILE **aebFp;
 	size_t sizeToRead;
+	vec_fullRec *vfr;
+	char **unmapped;
+	size_t *u_m, *u_n;
 } pipeline_t;
 
 typedef struct {
-	const pipeline_t *p;
+	pipeline_t *p;
     int n_seq;
 	bseq1_t *seq1;
 	bseq1_t *seq2;
@@ -484,6 +486,11 @@ int selectAlnRecs (mm_reg1_t *regs1, mm_reg1_t *regs2, int n_regs1, int n_regs2,
 			regs2->mapQ = qual2;
 			*mq2 = qual2;
 		}
+		else
+		{
+			regs2[i1].mapQ = 0;
+			*mq2 = 0;
+		}
 		return i1;
 	}
 	else
@@ -492,11 +499,11 @@ int selectAlnRecs (mm_reg1_t *regs1, mm_reg1_t *regs2, int n_regs1, int n_regs2,
 
 void create_aeb (bseq1_t *seq, mm_reg1_t *r, fullRec *fR)
 {
-	fR->pos = r->rs - r->qs;
+	fR->pos = r->rs - r->qs+1;
 	fR->flag = 0;
 	if (r->rev) 
 	{
-		fR->pos = r->rs - (seq->l_seq - r->qe);
+		fR->pos = r->rs - (seq->l_seq - r->qe) +1;
 		fR->flag = 16;
 	}
 	fR->qual = r->mapQ;
@@ -540,7 +547,13 @@ static void worker_for(void *_data, long i, int tid) // kt_for() callback
 //	int i1=0, j1=0;
     step_t *step = (step_t*)_data;
 	char **refFasta = step->p->refFasta;
-//	printf ("worker_for refFasta %p name %s\n", refFasta, step->seq1[i].name);
+	int maxChunkSize = step->p->maxChunkSize;
+	int numMaxChunks = step->p->numMaxChunks;
+	int n_threads = step->p->n_threads;
+	int numContigs = step->p->mi->n;
+	vec_fullRec *vfr = step->p->vfr;
+	vfr += tid*numContigs*numMaxChunks;
+
 	const mm_reg1_t *regs[2]={NULL,NULL};
 	int n_regs1, n_regs2=0;
 
@@ -552,15 +565,18 @@ static void worker_for(void *_data, long i, int tid) // kt_for() callback
 		step->n_reg[2*i+1] = n_regs2;
 	}
 	
+//	printf ("worker_for name %s, n_regs1 %d, n_regs2 %d\n", step->seq1[i].name, n_regs1, n_regs2);
 	if (n_regs1 > 0)
 	{
 		assign_score (refFasta, &(step->seq1[i]), regs[0], n_regs1);
 		qsort ((void *)regs[0], n_regs1, sizeof(mm_reg1_t), reg_compare);
+//		printf ("\t%s score1 %d\n", step->seq1[i].name, regs[0][0].score);
 	}
 	if (n_regs2 > 0)
 	{
 		assign_score (refFasta, &(step->seq2[i]), regs[1], n_regs2);
 		qsort ((void *)regs[1], n_regs2, sizeof(mm_reg1_t), reg_compare);
+//		printf ("\t%s score2 %d\n", step->seq2[i].name, regs[1][0].score);
 	}
 
 	int mq1=-1, mq2=-1;
@@ -571,7 +587,8 @@ static void worker_for(void *_data, long i, int tid) // kt_for() callback
 		int regs2Ind = selectAlnRecs (regs[0], regs[1], n_regs1, n_regs2, step->seq1[i].l_seq, lseq2, &mq1, &mq2);
 		if (regs2Ind != -1)
 		{
-//			printf ("%s - MQ1 %d MQ2 %d\n", step->seq1[i].name, mq1, mq2);
+//			if (regs[0][0].rid == 1)
+//				printf ("1 - %s n_regs1 %d, n_regs2 %d - MQ1 %d MQ2 %d\n", step->seq1[i].name, n_regs1, n_regs2, regs[0][0].mapQ, regs[1][regs2Ind].mapQ);
 			//vasu
 
 			step->reg[2*i] = (mm_reg1_t*)malloc(sizeof(mm_reg1_t));
@@ -580,14 +597,28 @@ static void worker_for(void *_data, long i, int tid) // kt_for() callback
 			memcpy(step->reg[2*i +1], &(regs[1][regs2Ind]), sizeof(mm_reg1_t));
 			step->n_reg[2*i] = step->n_reg[2*i+1] = 1;
 
-			mm_reg1_t *mmr = step->reg[2*i];
-			mmr->fR = (fullRec *)malloc (sizeof(fullRec));
-			assert (mmr->fR != NULL);
-			create_aeb (&(step->seq1[i]), mmr, mmr->fR);
-			mmr = step->reg[2*i +1];
-			mmr->fR = (fullRec *)malloc (sizeof(fullRec));
-			assert (mmr->fR != NULL);
-			create_aeb (&(step->seq2[i]), mmr, mmr->fR);
+			fullRec fR;
+			mm_reg1_t *r = step->reg[2*i];
+//			r->fR = (fullRec *)malloc (sizeof(fullRec));
+//			assert (r->fR != NULL);
+			create_aeb (&(step->seq1[i]), r, &fR);
+
+			int32_t actRefPos = r->rs - r->qs;
+			if (r->rev) actRefPos = r->rs - (step->seq1[i].l_seq - r->qe);
+			if (actRefPos < 0) actRefPos = 0;
+			int fileNo = r->rid*numMaxChunks + actRefPos/maxChunkSize;
+			kv_push_fr (vfr[fileNo], fR);
+
+			r = step->reg[2*i +1];
+//			r->fR = (fullRec *)malloc (sizeof(fullRec));
+//			assert (r->fR != NULL);
+			create_aeb (&(step->seq2[i]), r, &fR);
+
+			actRefPos = r->rs - r->qs;
+			if (r->rev) actRefPos = r->rs - (step->seq1[i].l_seq - r->qe);
+			if (actRefPos < 0) actRefPos = 0;
+			fileNo = r->rid*numMaxChunks + actRefPos/maxChunkSize;
+			kv_push_fr (vfr[fileNo], fR);
 		}
 		else
 		{
@@ -598,13 +629,40 @@ static void worker_for(void *_data, long i, int tid) // kt_for() callback
 				memcpy(step->reg[2*i], regs[0], sizeof(mm_reg1_t));
 				step->n_reg[2*i]=1;
 
-				mm_reg1_t *mmr = step->reg[2*i];
-				mmr->fR = (fullRec *)malloc (sizeof(fullRec));
-				assert (mmr->fR != NULL);
-				create_aeb (&(step->seq1[i]), mmr, mmr->fR);
+				fullRec fR;
+				mm_reg1_t *r = step->reg[2*i];
+//				r->fR = (fullRec *)malloc (sizeof(fullRec));
+//				assert (r->fR != NULL);
+				create_aeb (&(step->seq1[i]), r, &fR);
+
+				int actRefPos = r->rs - r->qs;
+				if (r->rev) actRefPos = r->rs - (step->seq1[i].l_seq - r->qe);
+				if (actRefPos < 0) actRefPos = 0;
+				int fileNo = r->rid*numMaxChunks + actRefPos/maxChunkSize;
+				kv_push_fr (vfr[fileNo], fR);
 			}
 			else
+			{//unmapped1
+				int readSize = step->seq1[i].l_name + 3 + 2*step->seq1[i].l_seq + 1 + 4;
+				if (step->seq2 != NULL)
+					readSize += step->seq2[i].l_name + 3 + 2*step->seq2[i].l_seq + 1 + 4;
+				if (step->p->u_n[tid] + readSize >= step->p->u_m[tid])
+				{
+					step->p->u_m[tid] = step->p->u_m[tid] ? step->p->u_m[tid] << 1 : 2*readSize;
+					step->p->unmapped[tid] = (char *)realloc (step->p->unmapped[tid], step->p->u_m[tid]);
+					assert (step->p->unmapped[tid] != NULL);
+				}
+				sprintf (&step->p->unmapped[tid][step->p->u_n[tid]], "@%s/1\n%s\n+\n%s\n", step->seq1[i].name, step->seq1[i].seq, step->seq1[i].qual);
+				step->p->u_n[tid] += step->seq1[i].l_name + 3 + 2*step->seq1[i].l_seq + 1 + 4;
+//				printf ("read %s read1Size %d\n", step->seq1[i].name, step->seq1[i].l_name + 3 + 2*step->seq1[i].l_seq + 1 + 4);
+				if (step->seq2 != NULL)
+				{
+					sprintf (&step->p->unmapped[tid][step->p->u_n[tid]], "@%s/2\n%s\n+\n%s\n", step->seq2[i].name, step->seq2[i].seq, step->seq2[i].qual);
+					step->p->u_n[tid] += step->seq2[i].l_name + 3 + 2*step->seq2[i].l_seq + 1 + 4;
+				}
+
 				step->n_reg[2*i] = step->n_reg[2*i+1] = 0;
+			}
 		}
 	}
 	else if ((n_regs2 > 0) && (regs[1][0].score >= step->seq2[i].l_seq - 4*4))
@@ -612,30 +670,81 @@ static void worker_for(void *_data, long i, int tid) // kt_for() callback
 		int regs1Ind = selectAlnRecs (regs[1], regs[0], n_regs2, n_regs1, step->seq2[i].l_seq, step->seq1[i].l_seq, &mq2, &mq1);
 		if (regs1Ind != -1)
 		{
-//			printf ("%s - MQ1 %d MQ2 %d\n", step->seq1[i].name, mq1, mq2);
+//			if (regs[1][0].rid == 1)
+//				printf ("2 - %s n_regs1 %d, n_regs2 %d - MQ1 %d MQ2 %d\n", step->seq1[i].name, n_regs1, n_regs2, mq1, mq2);
 			step->reg[2*i] = (mm_reg1_t*)malloc(sizeof(mm_reg1_t));
 			memcpy(step->reg[2*i], &(regs[0][regs1Ind]), sizeof(mm_reg1_t));
 			step->reg[2*i +1] = (mm_reg1_t*)malloc(sizeof(mm_reg1_t));
 			memcpy(step->reg[2*i +1], regs[1], sizeof(mm_reg1_t));
 			step->n_reg[2*i] = step->n_reg[2*i+1] = 1;
 
-			mm_reg1_t *mmr = step->reg[2*i];
-			mmr->fR = (fullRec *)malloc (sizeof(fullRec));
-			assert (mmr->fR != NULL);
-			create_aeb (&(step->seq1[i]), mmr, mmr->fR);
-			mmr = step->reg[2*i +1];
-			mmr->fR = (fullRec *)malloc (sizeof(fullRec));
-			assert (mmr->fR != NULL);
-			create_aeb (&(step->seq2[i]), mmr, mmr->fR);
+			fullRec fR;
+			mm_reg1_t *r = step->reg[2*i];
+//			r->fR = (fullRec *)malloc (sizeof(fullRec));
+//			assert (r->fR != NULL);
+			create_aeb (&(step->seq1[i]), r, &fR);
+
+			int actRefPos = r->rs - r->qs;
+			if (r->rev) actRefPos = r->rs - (step->seq1[i].l_seq - r->qe);
+			if (actRefPos < 0) actRefPos = 0;
+			int fileNo = r->rid*numMaxChunks + actRefPos/maxChunkSize;
+			kv_push_fr (vfr[fileNo], fR);
+
+			r = step->reg[2*i +1];
+//			r->fR = (fullRec *)malloc (sizeof(fullRec));
+//			assert (r->fR != NULL);
+			create_aeb (&(step->seq2[i]), r, &fR);
+
+			actRefPos = r->rs - r->qs;
+			if (r->rev) actRefPos = r->rs - (step->seq1[i].l_seq - r->qe);
+			if (actRefPos < 0) actRefPos = 0;
+			fileNo = r->rid*numMaxChunks + actRefPos/maxChunkSize;
+			kv_push_fr (vfr[fileNo], fR);
 		}
 		else
-		{
+		{//unmapped2
+
+			int readSize = step->seq1[i].l_name + 3 + 2*step->seq1[i].l_seq + 1 + 4;
+			if (step->seq2 != NULL)
+				readSize += step->seq2[i].l_name + 3 + 2*step->seq2[i].l_seq + 1 + 4;
+			if (step->p->u_n[tid] + readSize >= step->p->u_m[tid])
+			{
+				step->p->u_m[tid] = step->p->u_m[tid] ? step->p->u_m[tid] << 1 : 2*readSize;
+				step->p->unmapped[tid] = (char *)realloc (step->p->unmapped[tid], step->p->u_m[tid]);
+				assert (step->p->unmapped[tid] != NULL);
+			}
+			sprintf (&step->p->unmapped[tid][step->p->u_n[tid]], "@%s/1\n%s\n+\n%s\n", step->seq1[i].name, step->seq1[i].seq, step->seq1[i].qual);
+			step->p->u_n[tid] += step->seq1[i].l_name + 3 + 2*step->seq1[i].l_seq + 1 + 4;
+			if (step->seq2 != NULL)
+			{
+				sprintf (&step->p->unmapped[tid][step->p->u_n[tid]], "@%s/2\n%s\n+\n%s\n", step->seq2[i].name, step->seq2[i].seq, step->seq2[i].qual);
+				step->p->u_n[tid] += step->seq2[i].l_name + 3 + 2*step->seq2[i].l_seq + 1 + 4;
+			}
+
 //			printf ("Else2 %s (%d, %d)\n", step->seq2[i].name, step->n_reg[2*i], step->n_reg[2*i+1]);
 			step->n_reg[2*i] = step->n_reg[2*i+1] = 0;
 		}
 	}
-	else //unmapped or complex read
+	else //unmapped3 or complex read
 	{
+
+		int readSize = step->seq1[i].l_name + 3 + 2*step->seq1[i].l_seq + 1 + 4;
+		if (step->seq2 != NULL)
+			readSize += step->seq2[i].l_name + 3 + 2*step->seq2[i].l_seq + 1 + 4;
+		if (step->p->u_n[tid] + readSize >= step->p->u_m[tid])
+		{
+			step->p->u_m[tid] = step->p->u_m[tid] ? step->p->u_m[tid] << 1 : 2*readSize;
+			step->p->unmapped[tid] = (char *)realloc (step->p->unmapped[tid], step->p->u_m[tid]);
+			assert (step->p->unmapped[tid] != NULL);
+		}
+		sprintf (&step->p->unmapped[tid][step->p->u_n[tid]], "@%s/1\n%s\n+\n%s\n", step->seq1[i].name, step->seq1[i].seq, step->seq1[i].qual);
+		step->p->u_n[tid] += step->seq1[i].l_name + 3 + 2*step->seq1[i].l_seq + 1 + 4;
+		if (step->seq2 != NULL)
+		{
+			sprintf (&step->p->unmapped[tid][step->p->u_n[tid]], "@%s/2\n%s\n+\n%s\n", step->seq2[i].name, step->seq2[i].seq, step->seq2[i].qual);
+			step->p->u_n[tid] += step->seq2[i].l_name + 3 + 2*step->seq2[i].l_seq + 1 + 4;
+		}
+
 //		printf ("unmapped or complex read %s (%d, %d)\n", step->seq1[i].name, step->n_reg[2*i], step->n_reg[2*i+1]);
 		step->n_reg[2*i] = step->n_reg[2*i+1] = 0;
 	}
@@ -667,16 +776,15 @@ static void worker_for(void *_data, long i, int tid) // kt_for() callback
 
 static void *worker_pipeline(void *shared, int step, void *in)
 {
-	int i, j;
+	int i, j, k;
     pipeline_t *p = (pipeline_t*)shared;
     int numOutChunks = p->numOutChunks;
     int maxChunkSize = p->maxChunkSize;
     int numMaxChunks = p->numMaxChunks;
-    int *numAlnRecs = p->numAlnRecs;
     FILE **aebFp = p->aebFp;
-//	printf ("worker_pipeline sizeToRead %lu\n", p->sizeToRead);
 //    printf ("worker_pipeline p->refFasta %p p->mi %p numOutChunks %d, maxChunkSize %d, numMaxChunks %d\n", p->refFasta, p->mi, numOutChunks, maxChunkSize, numMaxChunks);
     double sTime = realtime();
+//	printf ("\tworker_pipeline Start step %d at %lf sec\n", step, sTime);
     double sTime_cpu = cputime();
     if (step == 0) { // step 0: read sequences
         step_t *s;
@@ -694,7 +802,7 @@ static void *worker_pipeline(void *shared, int step, void *in)
 				for (i = 0; i < p->n_threads; ++i)
 					s->buf2[i] = mm_tbuf_init();
 				int n_seq=0;
-				sTime = realtime();
+//				sTime = realtime();
 				s->seq2 = bseq_read2(p->fp2, s->n_seq);
 				assert (s->seq2 != NULL );
 				for (i = 0; i < s->n_seq; ++i)
@@ -713,17 +821,16 @@ static void *worker_pipeline(void *shared, int step, void *in)
 				s->n_reg = (int*)calloc(s->n_seq*2, sizeof(int));
 				s->reg = (mm_reg1_t**)calloc(s->n_seq*2, sizeof(mm_reg1_t*));
 			}
-//    			printf ("worker_pipeline step %d real %.3lf sec cpu %.3lf sec\n",  step, realtime()-sTime, cputime()-sTime_cpu);
+    			printf ("\t1-worker_pipeline step %d real %.3lf sec cpu %.3lf sec\n",  step, realtime()-sTime, cputime()-sTime_cpu);
 			return s;
 		} else free(s);
     } else if (step == 1) { // step 1: map
 		kt_for(p->n_threads, worker_for, in, ((step_t*)in)->n_seq);
-//    		printf ("worker_pipeline step %d real %.3lf sec cpu %.3lf sec\n",  step, realtime()-sTime, cputime()-sTime_cpu);
+    		printf ("\t2-worker_pipeline step %d real %.3lf sec cpu %.3lf sec\n",  step, realtime()-sTime, cputime()-sTime_cpu);
 		return in;
     } else if (step == 2) { // step 2: output
         step_t *s = (step_t*)in;
 //	printf ("step2 in\n");
-    	bzero (numAlnRecs, numMaxChunks*p->mi->n*sizeof(int));
 
 	const mm_idx_t *mi = p->mi;
 	for (i = 0; i < p->n_threads; ++i) mm_tbuf_destroy(s->buf1[i]);
@@ -734,14 +841,49 @@ static void *worker_pipeline(void *shared, int step, void *in)
 		for (i = 0; i < p->n_threads; ++i) mm_tbuf_destroy(s->buf2[i]);
 		free(s->buf2);
 	}
+	for (i=0; i<p->n_threads; i++)
+	{
+		for (j=0; j<p->mi->n; j++)
+		{
+			for (k=0; k<numMaxChunks; k++)
+			{
+				int vecNo = i * p->mi->n * numMaxChunks + j * numMaxChunks + k;
+				int fileNo = j * numMaxChunks + k;
+				if (p->vfr[vecNo].n > 0) 
+				{
+					if (aebFp[fileNo] == NULL)
+					{
+						char fName[500];
+						sprintf (fName, "%s/C%d_%d.aeb", p->oprefix, j, k);
+						aebFp[fileNo] = fopen (fName, "w");
+						assert (aebFp[fileNo] != NULL);
+					}
+//					printf ("vecNo %d FileNo %d - T%d C%d F%d : n:%lu a:%p\n", vecNo, fileNo, i, j, k, p->vfr[vecNo].n, p->vfr[vecNo].a);
+					fwrite (p->vfr[vecNo].a, sizeof (fullRec), p->vfr[vecNo].n, aebFp[fileNo]);
+					p->vfr[vecNo].n = 0;
+				}
+			}
+		}
+		if (p->u_n[i] > 0)
+		{
+			if (aebFp[p->mi->n*numMaxChunks] == NULL)//write2
+			{
+				char fName[500];
+				sprintf (fName, "%s/unmapped.fq", p->oprefix);
+				aebFp[p->mi->n*numMaxChunks] = fopen (fName, "w");
+			}
+			assert (aebFp[p->mi->n*numMaxChunks] != NULL);
+			fwrite (p->unmapped[i], 1, p->u_n[i], aebFp[p->mi->n*numMaxChunks]);
+			p->u_n[i] = 0;
+		}
+	}
 
 	for (i = 0; i < s->n_seq; ++i) {
 		bseq1_t *t = &s->seq1[i];
 		int found=0;
                 if ((t->rid % 1000000) == 0)
                         fprintf (stderr, "%d\t%s\n", t->rid, t->name);
-//		printf ("n_reg1 %d n_reg2 %d\n", s->n_reg[2*i], s->n_reg[2*i +1]);
-		if ((s->n_reg[2*i]== 0) && (s->n_reg[2*i +1] == 0))
+/*		if ((s->n_reg[2*i]== 0) && (s->n_reg[2*i +1] == 0))
 		{
 			if (aebFp[p->mi->n*numMaxChunks] == NULL)//write2
 			{
@@ -753,17 +895,14 @@ static void *worker_pipeline(void *shared, int step, void *in)
 			fprintf (aebFp[p->mi->n*numMaxChunks], "@%s/1\n%s\n+\n%s\n", s->seq1[i].name, s->seq1[i].seq, s->seq1[i].qual);
 			if (s->seq2 != NULL)
 				fprintf (aebFp[p->mi->n*numMaxChunks], "@%s/2\n%s\n+\n%s\n", s->seq2[i].name, s->seq2[i].seq, s->seq2[i].qual);
-		}
-//				printf ("i %d n_reg1 %d\n", i, s->n_reg[2*i]);
-		fullRec fR;
+		}*/
+/*		fullRec fR;
 		for (j = 0; j < s->n_reg[2*i]; ++j) {
 			mm_reg1_t *r = &s->reg[2*i][j];
 
 			int32_t actRefPos=r->rs - r->qs;
 			if (r->rev) actRefPos = r->rs - (t->l_seq - r->qe);
 			if (actRefPos < 0) actRefPos = 0;
-//				int idx=numAlnRecs[r->rid*numMaxChunks + actRefPos/maxChunkSize];
-//			create_aeb (t, r, &fR);
 			int fileNo = r->rid*numMaxChunks + actRefPos/maxChunkSize;
 			if (aebFp[fileNo] == NULL)
 			{
@@ -775,25 +914,22 @@ static void *worker_pipeline(void *shared, int step, void *in)
 			fwrite (r->fR, sizeof (fullRec), 1, aebFp[fileNo]);
 			free (r->fR);
 			r->fR=NULL;
-//			numAlnRecs[r->rid*numMaxChunks + actRefPos/maxChunkSize]++;
 //			if (r->len < p->opt->min_match) continue;//vasu
 
-/*				printf("%d\t%s\t%d\t%s\t%s\t%d\t%d\t%c\t", t->rid, t->name, t->l_seq, t->seq, t->qual, r->qs, r->qe, "+-"[r->rev]);
-				printf("%d", r->rid);
-				printf("\t%d\t%d\t%d\t%d\t%d\t255\tcm:i:%d\tscore %d\n", mi->len[r->rid], r->rs, r->re, r->len,
-						r->re - r->rs > r->qe - r->qs? r->re - r->rs : r->qe - r->qs, r->cnt, r->score);*/
-		}
+//				printf("%d\t%s\t%d\t%s\t%s\t%d\t%d\t%c\t", t->rid, t->name, t->l_seq, t->seq, t->qual, r->qs, r->qe, "+-"[r->rev]);
+//				printf("%d", r->rid);
+//				printf("\t%d\t%d\t%d\t%d\t%d\t255\tcm:i:%d\tscore %d\n", mi->len[r->rid], r->rs, r->re, r->len,
+//						r->re - r->rs > r->qe - r->qs? r->re - r->rs : r->qe - r->qs, r->cnt, r->score);
+		}*/
 		free(s->reg[2*i]);
 		if (s->seq2 != NULL)
       		{
 			t = &s->seq2[i];
-			for (j = 0; j < s->n_reg[2*i+1]; ++j) {
+/*			for (j = 0; j < s->n_reg[2*i+1]; ++j) {
 				mm_reg1_t *r = &s->reg[2*i+1][j];
 				int32_t actRefPos=r->rs - r->qs;
 				if (r->rev) actRefPos = r->rs - (t->l_seq - r->qe);
 				if (actRefPos < 0) actRefPos=0;
-//				create_aeb (t, r, &fR);
-//				numAlnRecs[r->rid*numMaxChunks + actRefPos/maxChunkSize]++;
 				int fileNo = r->rid*numMaxChunks + actRefPos/maxChunkSize;
 				if (aebFp[fileNo] == NULL)
 				{
@@ -807,11 +943,11 @@ static void *worker_pipeline(void *shared, int step, void *in)
 				r->fR=NULL;
 //				if (r->len < p->opt->min_match) continue;//vasu
 
-/*					printf("%d\t%s\t%d\t%s\t%s\t%d\t%d\t%c\t", t->rid, t->name, t->l_seq, t->seq, t->qual, r->qs, r->qe, "+-"[r->rev]);
-					printf("%d", r->rid);
-					printf("\t%d\t%d\t%d\t%d\t%d\t255\tcm:i:%d\tscore %d\n", mi->len[r->rid], r->rs, r->re, r->len,
-							r->re - r->rs > r->qe - r->qs? r->re - r->rs : r->qe - r->qs, r->cnt, r->score);*/
-			}
+//					printf("%d\t%s\t%d\t%s\t%s\t%d\t%d\t%c\t", t->rid, t->name, t->l_seq, t->seq, t->qual, r->qs, r->qe, "+-"[r->rev]);
+//					printf("%d", r->rid);
+//					printf("\t%d\t%d\t%d\t%d\t%d\t255\tcm:i:%d\tscore %d\n", mi->len[r->rid], r->rs, r->re, r->len,
+//							r->re - r->rs > r->qe - r->qs? r->re - r->rs : r->qe - r->qs, r->cnt, r->score);
+			}*/
 			free(s->reg[2*i +1]);
 		}
 //		printf ("s->seq1.name %p %p\n", s->seq1, s->seq1[i]);
@@ -829,45 +965,56 @@ static void *worker_pipeline(void *shared, int step, void *in)
 	if (s->seq2) free(s->seq2);
 	free(s);
     }
-//    printf ("worker_pipeline step %d real %.3lf sec cpu %.3lf sec\n",  step, realtime()-sTime, cputime()-sTime_cpu);
+    printf ("\t3-worker_pipeline step %d real %.3lf sec cpu %.3lf sec\n",  step, realtime()-sTime, cputime()-sTime_cpu);
     return 0;
 }
 
-int mm_map_file(int numOutChunks, int maxChunkSize, int numMaxChunks, int *numAlnRecs, fileIndex *fI, FILE **aebFp, char *oprefix, char **refFasta, const mm_idx_t *idx, const char *fn1, const char *fn2, const mm_mapopt_t *opt, int n_threads, int tbatch_size)
+int mm_map_file(int numTasks, int rank, int numInChunks, int numOutChunks, int maxChunkSize, int numMaxChunks, fileIndex *fI, FILE **aebFp, char *oprefix, char **refFasta, const mm_idx_t *idx, const char *fn1, const char *fn2, const mm_mapopt_t *opt, int n_threads, int tbatch_size)
 {
-	double rTime1=realtime();
+	fI[1]=fI[numInChunks-1];
 	pipeline_t pl;
+	int i=0;
 	memset(&pl, 0, sizeof(pipeline_t));
 	pl.refFasta = refFasta;
 	pl.oprefix = oprefix;
-	printf ("fp1 ofs \n");
 	pl.fp1 = bseq_open(fn1);//vasu
 	pl.sizeToRead = fI[1].offset-fI[0].offset;
 	bseq_seek (pl.fp1, fI[0].offset);
 
+//	kvec_t(fullRec) tmp;
+
+	vec_fullRec *vfr = (vec_fullRec *)malloc(n_threads * numMaxChunks * idx->n * sizeof(vec_fullRec));
+	assert (vfr != NULL);
+//	vfr++;
+	for (i=0;i<n_threads*numMaxChunks * idx->n; i++)
+		kv_init(vfr[i]);
+
 	pl.numOutChunks = numOutChunks;
 	pl.maxChunkSize = maxChunkSize;
 	pl.numMaxChunks = numMaxChunks;
-	pl.numAlnRecs = numAlnRecs;
 	pl.aebFp = aebFp;
+	pl.vfr = vfr;
+	pl.unmapped = (char **)calloc (n_threads, sizeof(char *));
+	pl.u_m = (size_t *)calloc (n_threads, sizeof (size_t));
+	pl.u_n = (size_t *)calloc (n_threads, sizeof (size_t));
+	assert ((pl.unmapped != NULL) && (pl.u_m != NULL) && (pl.u_n != NULL));
 	if (pl.fp1 == 0) return -1;
 //	printf ("fn1 %s fn2 %s\n", fn1, fn2);
 	if (fn2 != NULL)
 	{
-		printf ("fp2 ofs \n");
 		pl.fp2 = bseq_open(fn2);
 		if (pl.fp2 == 0) return -1;
 		bseq_seek (pl.fp2, fI[0].offset2);
 	}
-	printf ("SEEKOFS %lu SeekTime %.3lf sec\n", fI[0].offset, realtime()-rTime1);
 	pl.opt = opt, pl.mi = idx;
 	pl.n_threads = n_threads, pl.batch_size = tbatch_size;
 //	printf ("n_threads %d\n", pl.n_threads);
 	
-	int i=0;
 //	for (;i<n_threads; i++)
 		fpUnMapped=NULL;
-	kt_pipeline(n_threads == 1? 1 : 2, worker_pipeline, &pl, 3);
+	double rTime1=realtime();
+	kt_pipeline(n_threads == 1? 1 : 1, worker_pipeline, &pl, 3);
+	printf ("kt_pipeline time %.3lf sec\n", realtime()-rTime1);
 //	for (i=0;i<n_threads; i++)
 //	{
 		if (fpUnMapped != NULL)
@@ -878,5 +1025,16 @@ int mm_map_file(int numOutChunks, int maxChunkSize, int numMaxChunks, int *numAl
 //	}
 	bseq_close(pl.fp1);
 	if (pl.fp2 != NULL) bseq_close(pl.fp2);
+	for (i=0;i<n_threads*numMaxChunks * idx->n; i++)
+	{
+		if (vfr[i].n > 0) free (vfr[i].a);
+	}
+	for (i=0; i<n_threads; i++)
+	{
+		if (pl.unmapped[i] != NULL) free (pl.unmapped[i]);
+	}
+	free (pl.unmapped);
+	free (pl.u_m);
+	free (pl.u_n);
 	return 0;
 }

@@ -81,6 +81,13 @@ int main() {
 		}															\
 		(v).a[(v).n++] = (x);										\
 	} while (0)
+#define kv_push_fr(v, x) do {									\
+		if ((v).n == (v).m) {										\
+			(v).m = (v).m? (v).m<<1 : 2;							\
+			(v).a = (fullRec *)realloc((v).a, sizeof(fullRec) * (v).m);	\
+		}															\
+		(v).a[(v).n++] = (x);										\
+	} while (0)
 
 #define kv_pushp(type, v, p) do { \
 		if ((v).n == (v).m) { \

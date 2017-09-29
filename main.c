@@ -125,6 +125,7 @@ int main(int argc, char *argv[])
 
 	liftrlimit();
 	mm_realtime0 = realtime();
+	printf ("Start time %lf\n", mm_realtime0);
 	mm_mapopt_init(&opt);
 
 	while ((c = getopt(argc, argv, "o:w:k:B:b:t:r:c:f:Vv:NOg:I:d:lRPSpT:m:L:Dx:")) >= 0) {
@@ -214,7 +215,7 @@ int main(int argc, char *argv[])
 	if (is_idx) fpr = fopen(idxFileName, "rb");
 	else fp = bseq_open(argv[optind]);
 	if (fnw) fpw = fopen(fnw, "wb");
-	double indexTime=0;
+	double indexTime=0, fileStartTime=0;
 	for (;;) {
 		mm_idx_t *mi = 0;
 		if (fpr) mi = mm_idx_load(fpr);
@@ -241,8 +242,7 @@ int main(int argc, char *argv[])
 		printf ("MaxChunkSize %d, numOutChunks %d, max num of chunks per contig %d\n", maxChunkSize, numOutChunks, numMaxChunks);
 		readFasta (argv[optind], mi->n, mi->len);
 		indexTime = realtime();
-		int *numAlnRecs = (int *)malloc (numMaxChunks * mi->n * sizeof (int));
-		assert (numAlnRecs != NULL);
+		printf ("index End Timestamp %lf\n",  indexTime);
 		FILE **aebFp = (FILE **)calloc ((numMaxChunks * mi->n + 1), sizeof (FILE *));
 		assert (aebFp != NULL);
 		if (opt.flag & MM_F_PE)
@@ -258,20 +258,22 @@ int main(int argc, char *argv[])
 				assert (res==0);
 				int numRecs = buf.st_size/sizeof(fileIndex);
 				if (numTasks > 1)
-					assert ((numRecs > numTasks) && ((numRecs % numTasks)==1));
+					assert ((numRecs > numTasks*n_threads) && ((numRecs % (numTasks*n_threads))==1));
 				int chunksPerTask = (numRecs-1)/numTasks;
 				int startChunk = rank*chunksPerTask;
 				int endChunk = (rank+1)*chunksPerTask;
-				fileIndex fI[2];
+				fileIndex *fI = (fileIndex *)malloc(numRecs * sizeof(fileIndex));
+				assert (fI != NULL);
+
 				FILE *fpFI = fopen (fileName, "r");
-				fseek (fpFI, startChunk*sizeof(fileIndex), SEEK_SET);
-				fread (fI, sizeof(fileIndex), 1, fpFI);
-				fseek (fpFI, endChunk*sizeof(fileIndex), SEEK_SET);
-				fread (&fI[1], sizeof(fileIndex), 1, fpFI);
+				fread (fI, sizeof(fileIndex), numRecs, fpFI);
 				fclose (fpFI);
 				sprintf (fileName, "%s_%d", oprefix, rank);
-				printf ("Rank %d startOfs %lu,%lu sizetoread %lu,%lu\n", rank, fI[0].offset, fI[0].offset2, fI[1].offset-fI[0].offset, fI[1].offset2-fI[0].offset2);
-				mm_map_file(numOutChunks, maxChunkSize, numMaxChunks, numAlnRecs, fI, aebFp, fileName, refFasta, mi, argv[i], argv[i+1], &opt, n_threads, tbatch_size);
+				printf ("mm_map_file start time %lf\n", realtime());
+				mm_map_file(numTasks, rank, numRecs, numOutChunks, maxChunkSize, numMaxChunks, fI, aebFp, fileName, refFasta, mi, argv[i], argv[i+1], &opt, n_threads, tbatch_size);
+				printf ("mm_map_file end time %lf\n", realtime());
+
+				free (fI);
 			}
 		}
 		else
@@ -284,22 +286,24 @@ int main(int argc, char *argv[])
 				int res = stat (fileName, &buf);
 				assert (res==0);
 				int numRecs = buf.st_size/sizeof(fileIndex);
-				assert ((numRecs % numTasks)==1);
+				if (numTasks > 1)
+					assert ((numRecs > numTasks*n_threads) && ((numRecs % (numTasks*n_threads))==1));
 				int chunksPerTask = (numRecs-1)/numTasks;
 				int startChunk = rank*chunksPerTask;
 				int endChunk = (rank+1)*chunksPerTask;
-				fileIndex fI[2];
+				fileIndex *fI = (fileIndex *)malloc(numRecs * sizeof(fileIndex));
+				assert (fI != NULL);
 				FILE *fpFI = fopen (fileName, "r");
-				fseek (fpFI, startChunk*sizeof(fileIndex), SEEK_SET);
-				fread (fI, sizeof(fileIndex), 1, fpFI);
-				fseek (fpFI, endChunk*sizeof(fileIndex), SEEK_SET);
-				fread (&fI[1], sizeof(fileIndex), 1, fpFI);
+				fread (fI, sizeof(fileIndex), numRecs, fpFI);
 				fclose (fpFI);
 				sprintf (fileName, "%s_%d", oprefix, rank);
-				mm_map_file(numOutChunks, maxChunkSize, numMaxChunks, numAlnRecs, fI, aebFp, fileName, refFasta, mi, argv[i], NULL, &opt, n_threads, tbatch_size);
+				mm_map_file(numTasks, rank, numRecs, numOutChunks, maxChunkSize, numMaxChunks, fI, aebFp, fileName, refFasta, mi, argv[i], NULL, &opt, n_threads, tbatch_size);
+				free (fI);
 			}
 		}
 		int j=0;
+		fileStartTime = realtime();
+		printf ("file close start time %lf\n", fileStartTime);
 		for (i=0; i<mi->n; i++)
 		{
 			free (refFasta[i]);
@@ -307,12 +311,12 @@ int main(int argc, char *argv[])
 			for (j=0; j<numMaxChunks; j++)
 				if (aebFp[i*numMaxChunks+j] != NULL) fclose (aebFp[i*numMaxChunks+j]);
 		}
-		printf ("%aebFp[%d]=%p\n", mi->n*numMaxChunks, aebFp[mi->n*numMaxChunks]);
+//		printf ("aebFp[%d]=%p\n", mi->n*numMaxChunks, aebFp[mi->n*numMaxChunks]);
 		if (aebFp[mi->n*numMaxChunks] != NULL) fclose (aebFp[mi->n*numMaxChunks]);
+//		printf ("File close time %.3lf sec\n", realtime()-fileStartTime);
 		mm_idx_destroy(mi);
 		free (aebFp);
 		free (refFasta);
-		free (numAlnRecs);
 	}
 	if (fpw) fclose(fpw);
 	if (fpr) fclose(fpr);
@@ -322,7 +326,8 @@ int main(int argc, char *argv[])
 	fprintf(stderr, "[M::%s] CMD:", __func__);
 	for (i = 0; i < argc; ++i)
 		fprintf(stderr, " %s", argv[i]);
-	fprintf(stderr, "\n[M::%s] Rank %d Real time: %.3f sec(IndexTime %.3lf sec); CPU: %.3f sec\n", __func__, rank, realtime() - mm_realtime0, realtime()-indexTime, cputime());
+	printf ("app end time %lf\n", realtime());
+	fprintf(stderr, "\n[M::%s] Rank %d Real time: %.3f sec(IndexTime %.3lf sec); FileCloseTime %.3lf sec CPU: %.3f sec\n", __func__, rank, realtime() - mm_realtime0, indexTime-mm_realtime0, realtime()-fileStartTime, cputime());
 #ifdef USE_MPI
 	MPI_Barrier(MPI_COMM_WORLD);
 	if (rank == 0)
